@@ -9,7 +9,7 @@ import torch.nn.functional as F
 class LLMConfig:
     n_dim = 10  # Dimensions of the token vectors
     n_layers = 10  # Number of layers in the language model
-    vocab_size = 50_000  # Number of unique tokens
+    vocab_size = 128_000  # Number of unique tokens
 
 
 class Layer(nn.Module):
@@ -30,7 +30,7 @@ class Layer(nn.Module):
         return out
 
 
-class GPT(nn.Module):
+class LLM(nn.Module):
     def __init__(self, config: LLMConfig):
         super().__init__()
         self.config = config
@@ -41,6 +41,13 @@ class GPT(nn.Module):
         self.norm = nn.LayerNorm(normalized_shape=self.config.n_dim)
 
     def forward(self, x):
+        """
+        Args:
+            x: Input tokens
+            These tokens represent the input sequence, usually in the shape of B, S, D
+        Returns:
+            Log probs, in the shape of B, S
+        """
         x = self.embeddings(x)
         for l in self.layers:
             x = self.norm(x + l(x))
