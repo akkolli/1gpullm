@@ -9,11 +9,13 @@ import torch.nn.functional as F
 class LLMConfig:
     n_dim = 10  # Dimensions of the token vectors
     n_layers = 10  # Number of layers in the language model
-    vocab_size = 128_000  # Number of unique tokens
+    vocab_size = 1024  # Number of unique tokens
+    seq_len = 64  # Context length
 
 
 class Layer(nn.Module):
     def __init__(self, config: LLMConfig):
+        super().__init__()
         self.config = config
         self.qkv = nn.Linear(self.config.n_dim, self.config.n_dim * 3)
         self.ffn = nn.Sequential(
@@ -23,9 +25,11 @@ class Layer(nn.Module):
         )
 
     def forward(self, x):
-        q, k, v = self.qkv(x).split(split_size_or_sections=3, dim=-1)
-        scores = (F.softmax(q @ k.T) / self.config.n_dim**-0.5).tril()
-        out = v @ scores
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        scores = (
+            F.softmax(q @ k.transpose(-1, -2), dim=-1) / self.config.n_dim**-0.5
+        ).tril()
+        out = scores @ v
         out = self.ffn(out)
         return out
 
@@ -39,6 +43,7 @@ class LLM(nn.Module):
         )
         self.embeddings = nn.Embedding(self.config.vocab_size, self.config.n_dim)
         self.norm = nn.LayerNorm(normalized_shape=self.config.n_dim)
+        self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size)
 
     def forward(self, x):
         """
@@ -52,4 +57,17 @@ class LLM(nn.Module):
         for l in self.layers:
             x = self.norm(x + l(x))
 
+        x = self.lm_head(x)
         return x
+
+
+def param_breakdown(model):
+    total = 0
+    for name, module in model.named_children():
+        n = sum(p.numel() for p in module.parameters())
+        total += n
+        print(
+            f"  {name:20s} {n:>12,}  ({100 * n / sum(p.numel() for p in model.parameters()):.1f}%)"
+        )
+    print(f"  {'TOTAL':20s} {total:>12,}")
+    return total
