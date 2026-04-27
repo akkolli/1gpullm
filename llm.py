@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -7,10 +8,10 @@ import torch.nn.functional as F
 
 @dataclass
 class LLMConfig:
-    n_dim = 10  # Dimensions of the token vectors
+    n_dim = 64  # Dimensions of the token vectors
     n_layers = 10  # Number of layers in the language model
     vocab_size = 1024  # Number of unique tokens
-    seq_len = 64  # Context length
+    seq_len = 128  # Context length
 
 
 class Layer(nn.Module):
@@ -23,14 +24,26 @@ class Layer(nn.Module):
             nn.ReLU(),
             nn.Linear(self.config.n_dim * 4, self.config.n_dim),
         )
+        self.register_buffer(
+            "mask",
+            torch.triu(
+                torch.ones(
+                    self.config.seq_len,
+                    self.config.seq_len,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            ),
+        )
 
     def forward(self, x):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        scores = (
-            F.softmax(q @ k.transpose(-1, -2), dim=-1) / self.config.n_dim**-0.5
-        ).tril()
-        out = scores @ v
-        out = self.ffn(out)
+        T = q.size(-2)
+        scores = (q @ k.transpose(-1, -2)) * self.config.n_dim**-0.5
+        scores = scores.masked_fill(self.mask[:T, :T], float("-inf"))
+        attn = F.softmax(scores, dim=-1)
+        out = x + attn @ v
+        out = out + self.ffn(out)
         return out
 
 
@@ -42,9 +55,27 @@ class LLM(nn.Module):
             [Layer(self.config) for _ in range(self.config.n_layers)]
         )
         self.embeddings = nn.Embedding(self.config.vocab_size, self.config.n_dim)
-        self.norm = nn.LayerNorm(normalized_shape=self.config.n_dim)
+        self.norms = nn.ModuleList(
+            [
+                nn.LayerNorm(normalized_shape=self.config.n_dim)
+                for _ in range(self.config.n_layers)
+            ]
+        )
         self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size)
+
+        self.register_buffer("pos_idx", torch.arange(self.config.seq_len))
         self.pos = nn.Embedding(self.config.seq_len, self.config.n_dim)
+        # self.init_std = math.sqrt(2 / self.config.n_dim)
+        self.init_std = 0.02
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=self.init_std)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=self.init_std)
 
     def forward(self, x):
         """
@@ -54,9 +85,12 @@ class LLM(nn.Module):
         Returns:
             Log probs, in the shape of B, S
         """
+        B, S = x.shape
         x = self.embeddings(x)
-        for l in self.layers:
-            x = self.norm(x + l(x))
+        pos_tok = self.pos(self.pos_idx[:S])
+        x = x + pos_tok
+        for l, norm in zip(self.layers, self.norms):
+            x = norm(l(x))
 
         x = self.lm_head(x)
         return x
@@ -77,9 +111,6 @@ class LLM(nn.Module):
         was_training = self.training
         self.eval()
         for _ in range(max_new_tokens):
-            # crop to the last seq_len tokens — model has no positional embedding
-            # so longer sequences aren't fundamentally broken, but training only
-            # saw seq_len tokens of context, so longer is out of distribution
             idx_cond = idx[:, -self.config.seq_len :]
             logits = self.forward(idx_cond)[:, -1, :]  # (B, V)
             if temperature == 0.0:

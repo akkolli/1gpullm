@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
 from llm import LLM, LLMConfig, param_breakdown
@@ -19,21 +20,37 @@ val_dataset = ShardedTokenDataset("val")
 
 @dataclass
 class TrainConfig:
-    RUN_NAME: str = "v1.1"
+    RUN_NAME: str = "v1.2"
     epochs = 10
-    train_steps = 8000
+    train_steps = 4000
     val_steps = 100
     batch_size = 512
     val_interval = 1  # Epoch between val intervals
+    peak_lr: float = 5e-4
+    lr_warmup: int = 200
+    min_lr_ratio: float = 0.1
 
 
 def train(model, train_dataloader, val_dataloader, train_config):
     model.to("cuda")
-    optimizer = AdamW(model.parameters(), lr=1e-4)
+    optimizer = AdamW(model.parameters(), lr=train_config.peak_lr)
     losses = []
     val_losses = []
     check_point_path = f"./checkpoints/{train_config.RUN_NAME}"
     os.makedirs(check_point_path, exist_ok=True)
+    total_steps = train_config.train_steps * train_config.epochs
+
+    def lr_lamda(step):
+        if step < train_config.lr_warmup:
+            return (step + 1) / train_config.lr_warmup
+        progress = (step - train_config.lr_warmup) / max(
+            1, total_steps - train_config.lr_warmup
+        )
+        return train_config.min_lr_ratio + (1 - train_config.min_lr_ratio) * 0.5 * (
+            1 + math.cos(math.pi * progress)
+        )
+
+    scheduler = LambdaLR(optimizer, lr_lamda)
 
     tokens_per_step = train_config.batch_size * model.config.seq_len
     tokens_covered = tokens_per_step * train_config.train_steps * train_config.epochs
@@ -75,6 +92,7 @@ def train(model, train_dataloader, val_dataloader, train_config):
             loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
             loss.backward()
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             x.to("cpu")
             y.to("cpu")
@@ -154,6 +172,8 @@ def plot_graphs(loss_dict, train_config):
 
     plt.plot(loss_dict["train_loss"], color="blue")
     plt.plot(loss_dict["val_loss"], color="red")
+    plt.ylim(-0.5, 7)
+    plt.xlim(0, train_config.epochs)
     plt.xlabel("Epochs")
     plt.ylabel("Perplexity")
     plt.savefig(check_point_path + "/loss_curve.png")
