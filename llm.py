@@ -61,13 +61,14 @@ class LLM(nn.Module):
                 for _ in range(self.config.n_layers)
             ]
         )
-        self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size)
+        self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size, bias=False)
 
         self.register_buffer("pos_idx", torch.arange(self.config.seq_len))
         self.pos = nn.Embedding(self.config.seq_len, self.config.n_dim)
         # self.init_std = math.sqrt(2 / self.config.n_dim)
         self.init_std = 0.02
         self.apply(self._init_weights)
+        self.lm_head.weight = self.embeddings.weight
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

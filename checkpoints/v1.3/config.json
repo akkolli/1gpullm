@@ -1,0 +1,6 @@
+{
+  "RUN_NAME": "v1.3",
+  "peak_lr": 0.0005,
+  "lr_warmup": 200,
+  "min_lr_ratio": 0.1
+}

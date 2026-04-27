@@ -20,19 +20,23 @@ val_dataset = ShardedTokenDataset("val")
 
 @dataclass
 class TrainConfig:
-    RUN_NAME: str = "v1.2"
+    RUN_NAME: str = "v1.4"
     epochs = 10
-    train_steps = 4000
+    train_steps = 7000
     val_steps = 100
     batch_size = 512
     val_interval = 1  # Epoch between val intervals
-    peak_lr: float = 5e-4
+    peak_lr: float = 3e-4
     lr_warmup: int = 200
     min_lr_ratio: float = 0.1
 
 
 def train(model, train_dataloader, val_dataloader, train_config):
-    model.to("cuda")
+    torch.set_float32_matmul_precision("medium")
+
+    model = model.to("cuda")
+    total_params = param_breakdown(model)
+    model = torch.compile(model)
     optimizer = AdamW(model.parameters(), lr=train_config.peak_lr)
     losses = []
     val_losses = []
@@ -51,7 +55,6 @@ def train(model, train_dataloader, val_dataloader, train_config):
         )
 
     scheduler = LambdaLR(optimizer, lr_lamda)
-
     tokens_per_step = train_config.batch_size * model.config.seq_len
     tokens_covered = tokens_per_step * train_config.train_steps * train_config.epochs
     total_tokens = train_dataloader.total_tokens
@@ -59,7 +62,7 @@ def train(model, train_dataloader, val_dataloader, train_config):
         f"Covering {(tokens_covered / total_tokens) * 100:.4f}% of the dataset "
         f"({tokens_covered / 1e6:.2f}M tokens)"
     )
-    total_params = param_breakdown(model)
+
     print(f"Tokens/param = {tokens_covered / total_params:.4f}")
 
     batch_load_total = 0.0
@@ -88,8 +91,10 @@ def train(model, train_dataloader, val_dataloader, train_config):
                 batch_load_total += time.perf_counter() - t_batch_start
                 t_model_start = time.perf_counter()
 
-            preds = model(x)
-            loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                preds = model(x)
+                loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
+
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -144,7 +149,8 @@ def train(model, train_dataloader, val_dataloader, train_config):
         f"step={avg_step * 1000:.2f}ms, {tokens_per_step / avg_step:.0f} tok/s"
     )
 
-    torch.save(model.state_dict(), check_point_path + "/final.pth")
+    raw_model = getattr(model, "_orig_mod", model)
+    torch.save(raw_model.state_dict(), check_point_path + "/final.pth")
     with open(check_point_path + "/config.json", "w") as f:
         json.dump(asdict(train_config), f, indent=2)
 
@@ -170,13 +176,17 @@ def plot_graphs(loss_dict, train_config):
 
     check_point_path = f"./checkpoints/{train_config.RUN_NAME}"
 
-    plt.plot(loss_dict["train_loss"], color="blue")
-    plt.plot(loss_dict["val_loss"], color="red")
-    plt.ylim(-0.5, 7)
-    plt.xlim(0, train_config.epochs)
-    plt.xlabel("Epochs")
-    plt.ylabel("Perplexity")
-    plt.savefig(check_point_path + "/loss_curve.png")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    epochs = range(1, len(loss_dict["train_loss"]) + 1)
+    ax.plot(epochs, loss_dict["train_loss"], color="blue", marker="o", label="train")
+    ax.plot(epochs, loss_dict["val_loss"], color="red", marker="o", label="val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Cross-entropy loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(check_point_path + "/loss_curve.png", dpi=150)
+    plt.close(fig)
 
 
 if __name__ == "__main__":

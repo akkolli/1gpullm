@@ -410,6 +410,7 @@ def main():
     ckpt = args.checkpoint or f"checkpoints/{args.run_name}/final.pth"
     print(f"[init] loading checkpoint {ckpt}")
     state = torch.load(ckpt, map_location=args.device)
+    state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     model.load_state_dict(state)
     model.to(args.device)
     model.eval()

@@ -118,6 +118,7 @@ def main():
     model = LLM(LLMConfig())
     ckpt_path = args.checkpoint or f"checkpoints/{args.run_name}/final.pth"
     state = torch.load(ckpt_path, map_location=args.device)
+    state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     model.load_state_dict(state)
     model.to(args.device)
 
