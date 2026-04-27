@@ -44,6 +44,7 @@ class LLM(nn.Module):
         self.embeddings = nn.Embedding(self.config.vocab_size, self.config.n_dim)
         self.norm = nn.LayerNorm(normalized_shape=self.config.n_dim)
         self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size)
+        self.pos = nn.Embedding(self.config.seq_len, self.config.n_dim)
 
     def forward(self, x):
         """
@@ -59,6 +60,42 @@ class LLM(nn.Module):
 
         x = self.lm_head(x)
         return x
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=0.0, top_k=None):
+        """Autoregressively extend `idx` by `max_new_tokens` tokens.
+
+        Args:
+            idx: (B, S) int64 token ids — the prompt
+            max_new_tokens: how many tokens to append
+            temperature: 0.0 = greedy argmax; >0 = sample from softmax(logits/T)
+            top_k: if set, restrict sampling to the top-k logits before softmax
+
+        Returns:
+            (B, S + max_new_tokens) int64 tensor — prompt + generated tokens
+        """
+        was_training = self.training
+        self.eval()
+        for _ in range(max_new_tokens):
+            # crop to the last seq_len tokens — model has no positional embedding
+            # so longer sequences aren't fundamentally broken, but training only
+            # saw seq_len tokens of context, so longer is out of distribution
+            idx_cond = idx[:, -self.config.seq_len :]
+            logits = self.forward(idx_cond)[:, -1, :]  # (B, V)
+            if temperature == 0.0:
+                next_tok = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    k = min(top_k, logits.size(-1))
+                    v, _ = torch.topk(logits, k)
+                    logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+                probs = F.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_tok], dim=1)
+        if was_training:
+            self.train()
+        return idx
 
 
 def param_breakdown(model):

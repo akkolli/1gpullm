@@ -11,7 +11,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from llm import LLM, LLMConfig, param_breakdown
-from prepare_data import ShardedTokenDataset
+from prepare_pretraining_data import ShardedTokenDataset
 
 train_dataset = ShardedTokenDataset("train")
 val_dataset = ShardedTokenDataset("val")
@@ -19,9 +19,9 @@ val_dataset = ShardedTokenDataset("val")
 
 @dataclass
 class TrainConfig:
-    RUN_NAME: str = "v1"
+    RUN_NAME: str = "v1.1"
     epochs = 10
-    train_steps = 2000
+    train_steps = 8000
     val_steps = 100
     batch_size = 512
     val_interval = 1  # Epoch between val intervals
@@ -76,6 +76,8 @@ def train(model, train_dataloader, val_dataloader, train_config):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            x.to("cpu")
+            y.to("cpu")
 
             if is_last_epoch:
                 torch.cuda.synchronize()
@@ -105,8 +107,8 @@ def train(model, train_dataloader, val_dataloader, train_config):
         val_ppl = math.exp(avg_val_l)
 
         print(
-            f"Epoch {epoch}: Train CE {avg_train_l:.4f} PPL {train_ppl:.2f} Acc {1 - (train_ppl / model.config.vocab_size):.2f}"
-            f"Val CE {avg_val_l:.4f} PPL {val_ppl:.2f} Acc {1 - (val_ppl / model.config.vocab_size):.2f}"
+            f"Epoch {epoch}: Train CE {avg_train_l:.4f} PPL {train_ppl:.2f} Acc {1 - (train_ppl / model.config.vocab_size):.2f} |"
+            f" Val CE {avg_val_l:.4f} PPL {val_ppl:.2f} Acc {1 - (val_ppl / model.config.vocab_size):.2f}"
         )
         losses.append(avg_train_l)
         val_losses.append(avg_val_l)
@@ -158,7 +160,8 @@ def plot_graphs(loss_dict, train_config):
 
 
 if __name__ == "__main__":
-    config = LLMConfig()
-    model = LLM(config)
-    _, measurements = train(model, train_dataset, val_dataset, TrainConfig)
-    plot_graphs(measurements, TrainConfig)
+    model_config = LLMConfig()
+    train_config = TrainConfig()
+    model = LLM(model_config)
+    _, measurements = train(model, train_dataset, val_dataset, train_config)
+    plot_graphs(measurements, train_config)
