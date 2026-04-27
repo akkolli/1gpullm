@@ -8,11 +8,11 @@ import torch.nn.functional as F
 
 @dataclass
 class LLMConfig:
-    n_dim = 512  # Dimensions of the token vectors
-    n_layers = 6  # Number of layers in the language model
-    n_heads = 16
-    vocab_size = 4096  # Number of unique tokens
-    seq_len = 128  # Context length
+    n_dim: int = 512  # Dimensions of the token vectors
+    n_layers: int = 8  # Number of layers in the language model
+    n_heads: int = 16
+    vocab_size: int = 16382  # Number of unique tokens
+    seq_len: int = 512  # Context length
 
 
 class Layer(nn.Module):
@@ -21,13 +21,14 @@ class Layer(nn.Module):
         self.config = config
         assert self.config.n_dim % self.config.n_heads == 0
         self.config.head_dim = self.config.n_dim // self.config.n_heads
-        self.qkv = nn.Linear(self.config.n_dim, self.config.n_dim * 3)
-        self.norm1 = nn.LayerNorm(normalized_shape=self.config.n_dim)
-        self.norm2 = nn.LayerNorm(normalized_shape=self.config.n_dim)
+        self.qkv = nn.Linear(self.config.n_dim, self.config.n_dim * 3, bias=False)
+        self.mix = nn.Linear(self.config.n_dim, self.config.n_dim, bias=False)
+        self.norm1 = nn.RMSNorm(normalized_shape=self.config.n_dim)
+        self.norm2 = nn.RMSNorm(normalized_shape=self.config.n_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(self.config.n_dim, self.config.n_dim * 4),
-            nn.ReLU(),
-            nn.Linear(self.config.n_dim * 4, self.config.n_dim),
+            nn.Linear(self.config.n_dim, self.config.n_dim * 4, bias=False),
+            nn.GELU(),
+            nn.Linear(self.config.n_dim * 4, self.config.n_dim, bias=False),
         )
         # self.register_buffer(
         #     "mask",
@@ -54,7 +55,7 @@ class Layer(nn.Module):
         # out = x + attn @ v
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
         attn = attn.transpose(1, 2).contiguous().view(B, T, C)
-        out = x + attn
+        out = x + self.mix(attn)
         out = out + self.ffn(self.norm2(out))
         return out
 
@@ -67,10 +68,12 @@ class LLM(nn.Module):
             [Layer(self.config) for _ in range(self.config.n_layers)]
         )
         self.embeddings = nn.Embedding(self.config.vocab_size, self.config.n_dim)
-        self.norm = nn.LayerNorm(normalized_shape=self.config.n_dim)
+        self.norm = nn.RMSNorm(normalized_shape=self.config.n_dim)
         self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size, bias=False)
 
-        self.register_buffer("pos_idx", torch.arange(self.config.seq_len))
+        self.register_buffer(
+            "pos_idx", torch.arange(self.config.seq_len), persistent=False
+        )
         self.pos = nn.Embedding(self.config.seq_len, self.config.n_dim)
         # self.init_std = math.sqrt(2 / self.config.n_dim)
         self.init_std = 0.02

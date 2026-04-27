@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 from llm import LLMConfig
 
-MAX_DOCS = 1000
+MAX_DOCS = 100_000
 TOKENIZER_PATH = "tokenizer/tokenizer.json"
 TOKENIZER_CONFIG_PATH = "tokenizer/tokenizer_config.json"
 
@@ -295,9 +295,7 @@ class ShardedTokenDataset:
             if slot["event"] is not None:
                 slot["event"].synchronize()
 
-            self._fill_one(
-                slot["x_np"], slot["y_np"], batch_size, context_len, rng
-            )
+            self._fill_one(slot["x_np"], slot["y_np"], batch_size, context_len, rng)
 
             # Async H2D, then record an event so the consumer's stream can
             # wait on it. Issued from this thread; the event carries the
@@ -467,12 +465,14 @@ if __name__ == "__main__":
         print(
             f"[tokenizer] vocab_size = {tokenizer.get_vocab_size()}, eot_id = {eot_id}"
         )
-        exit()
 
     SHARD_SIZE = 250_000_000  # ~1GB per shard at uint32
+    MAX_TRAIN_TOKENS = 1_000_000_000  # ~10% of fineweb sample-10BT; ~3x training headroom
     VAL_EVERY = 1000
     STATUS_EVERY = 50_000  # high-level progress print every N docs
-    NPROCS = max(2, (os.cpu_count() or 4) - 2)
+    # 8 workers is plenty for tokenization throughput. Higher counts blew up
+    # RSS via fork()'d HF dataset state and Rayon thread mutexes (deadlock).
+    NPROCS = min(8, max(2, (os.cpu_count() or 4) - 2))
     WORKER_BATCH = 64  # docs per task sent to a worker; amortizes IPC
 
     def encode_both_splits():
@@ -484,10 +484,19 @@ if __name__ == "__main__":
         out_dir = "dataset/fineweb"
         os.makedirs(out_dir, exist_ok=True)
 
+        # Wipe any prior shards so a smaller re-run can't leave stale tail
+        # shards lying around from a previous larger encode.
+        stale = sorted(glob.glob(os.path.join(out_dir, "fineweb_*.bin")))
+        if stale:
+            print(f"[encode] removing {len(stale)} stale shard file(s)")
+            for p in stale:
+                os.remove(p)
+
         print(f"[encode] output dir: {out_dir}/")
         print(
             f"[encode] shard size = {SHARD_SIZE:,} tokens (~{SHARD_SIZE * 4 / 1e9:.1f}GB each)"
         )
+        print(f"[encode] cap = {MAX_TRAIN_TOKENS:,} train tokens (~{MAX_TRAIN_TOKENS * 4 / 1e9:.1f}GB)")
         print(f"[encode] {NPROCS} workers, worker_batch = {WORKER_BATCH}")
         print(f"[encode] val ratio = 1/{VAL_EVERY}")
 
@@ -553,15 +562,19 @@ if __name__ == "__main__":
         last_status_docs = 0
         processed = 0
 
-        # fork is the default on Linux and skips re-import overhead. The worker
-        # initializer pins each child to RAYON_NUM_THREADS=1 before it loads
-        # the tokenizer, so per-process Rayon doesn't oversubscribe the box.
-        ctx = mp.get_context("fork")
+        # spawn (not fork): fork copies the parent's Rayon thread pool and HF
+        # `datasets` state into every child, which both balloons RSS and
+        # deadlocks on mutexes the non-calling threads were holding. spawn
+        # re-imports the module in a clean child interpreter — _worker_init
+        # then pins Rayon to 1 thread before loading the tokenizer.
+        ctx = mp.get_context("spawn")
         with ctx.Pool(
             processes=NPROCS,
             initializer=_worker_init,
             initargs=(TOKENIZER_PATH,),
+            maxtasksperchild=50,  # recycle workers so any per-task creep gets freed
         ) as pool:
+            stop_consuming = False
             try:
                 for results in pool.imap_unordered(
                     _worker_encode_batch, doc_batches(), chunksize=2
@@ -571,13 +584,19 @@ if __name__ == "__main__":
                         append(split, arr)
                         processed += 1
 
+                        if state["train"]["total_tokens"] >= MAX_TRAIN_TOKENS:
+                            print(
+                                f"[encode] hit cap: {state['train']['total_tokens']:,} "
+                                f">= {MAX_TRAIN_TOKENS:,} train tokens"
+                            )
+                            stop_consuming = True
+                            break
+
                         if processed % STATUS_EVERY == 0:
                             now = time.time()
                             interval_docs = processed - last_status_docs
                             interval_dt = now - last_status
-                            rate = (
-                                interval_docs / interval_dt if interval_dt > 0 else 0
-                            )
+                            rate = interval_docs / interval_dt if interval_dt > 0 else 0
                             elapsed_min = (now - t_start) / 60
                             print(
                                 f"[status] doc {processed:,} | {rate:.0f} docs/s | "
@@ -589,7 +608,13 @@ if __name__ == "__main__":
                             )
                             last_status = now
                             last_status_docs = processed
-                print(f"[encode] stream exhausted")
+                    if stop_consuming:
+                        break
+                if stop_consuming:
+                    print(f"[encode] cap reached, terminating workers")
+                    pool.terminate()  # don't drain the rest of the stream
+                else:
+                    print(f"[encode] stream exhausted")
             finally:
                 print(f"[encode] finalizing...")
                 for split, s in state.items():

@@ -20,14 +20,14 @@ val_dataset = ShardedTokenDataset("val")
 
 @dataclass
 class TrainConfig:
-    RUN_NAME: str = "v1.5"
+    RUN_NAME: str = "v1.6"
     epochs = 10
-    train_steps = 4500
+    train_steps = 500
     val_steps = 100
-    batch_size = 64
+    batch_size = 192
     val_interval = 1  # Epoch between val intervals
-    peak_lr: float = 1e-4
-    lr_warmup: int = 200
+    peak_lr: float = 1e-3
+    lr_warmup: int = 1
     min_lr_ratio: float = 0.2
 
 
@@ -36,8 +36,14 @@ def train(model, train_dataloader, val_dataloader, train_config):
 
     model = model.to("cuda")
     total_params = param_breakdown(model)
-    model = torch.compile(model)
-    optimizer = AdamW(model.parameters(), lr=train_config.peak_lr)
+    model = torch.compile(model, mode="reduce-overhead")
+    optimizer = AdamW(
+        model.parameters(),
+        lr=train_config.peak_lr,
+        betas=(0.9, 0.95),
+        weight_decay=0.1,
+        fused=True,
+    )
     losses = []
     val_losses = []
     check_point_path = f"./checkpoints/{train_config.RUN_NAME}"
@@ -76,7 +82,7 @@ def train(model, train_dataloader, val_dataloader, train_config):
             torch.cuda.synchronize()
             epoch_start = time.perf_counter()
 
-        train_loss = 0
+        loss_accum = torch.zeros((), device="cuda")
         for step in tqdm(range(train_config.train_steps)):
             if is_last_epoch:
                 torch.cuda.synchronize()
@@ -96,17 +102,18 @@ def train(model, train_dataloader, val_dataloader, train_config):
                 loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            x.to("cpu")
-            y.to("cpu")
+            # x.to("cpu")
+            # y.to("cpu")
 
             if is_last_epoch:
                 torch.cuda.synchronize()
                 model_total += time.perf_counter() - t_model_start
 
-            train_loss += loss.item()
+            loss_accum += loss.detach()
 
         if is_last_epoch:
             torch.cuda.synchronize()
@@ -119,12 +126,13 @@ def train(model, train_dataloader, val_dataloader, train_config):
                 x, y = val_dataloader.get_batch(
                     train_config.batch_size, model.config.seq_len, device="cuda"
                 )
-                preds = model(x)
-                loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    preds = model(x)
+                    loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
                 val_loss += loss.item()
         model.train()
 
-        avg_train_l = train_loss / train_config.train_steps
+        avg_train_l = loss_accum.item() / train_config.train_steps
         avg_val_l = val_loss / train_config.val_steps
         train_ppl = math.exp(avg_train_l)
         val_ppl = math.exp(avg_val_l)
