@@ -8,10 +8,10 @@ import torch.nn.functional as F
 
 @dataclass
 class LLMConfig:
-    n_dim = 128  # Dimensions of the token vectors
-    n_layers = 10  # Number of layers in the language model
-    n_heads = 8
-    vocab_size = 1024  # Number of unique tokens
+    n_dim = 512  # Dimensions of the token vectors
+    n_layers = 6  # Number of layers in the language model
+    n_heads = 16
+    vocab_size = 4096  # Number of unique tokens
     seq_len = 128  # Context length
 
 
@@ -19,7 +19,11 @@ class Layer(nn.Module):
     def __init__(self, config: LLMConfig):
         super().__init__()
         self.config = config
+        assert self.config.n_dim % self.config.n_heads == 0
+        self.config.head_dim = self.config.n_dim // self.config.n_heads
         self.qkv = nn.Linear(self.config.n_dim, self.config.n_dim * 3)
+        self.norm1 = nn.LayerNorm(normalized_shape=self.config.n_dim)
+        self.norm2 = nn.LayerNorm(normalized_shape=self.config.n_dim)
         self.ffn = nn.Sequential(
             nn.Linear(self.config.n_dim, self.config.n_dim * 4),
             nn.ReLU(),
@@ -37,15 +41,21 @@ class Layer(nn.Module):
         #     ),
         # )
 
-    def forward(self, x):
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        T = q.size(-2)
+    def forward(self, x, causal=True):
+
+        B, T, C = x.shape
+        q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
+        q = q.view(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
         # scores = (q @ k.transpose(-1, -2)) * self.config.n_dim**-0.5
         # scores = scores.masked_fill(self.mask[:T, :T], float("-inf"))
         # attn = F.softmax(scores, dim=-1)
         # out = x + attn @ v
-        out = x + F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        out = out + self.ffn(out)
+        attn = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
+        out = x + attn
+        out = out + self.ffn(self.norm2(out))
         return out
 
 
@@ -57,12 +67,7 @@ class LLM(nn.Module):
             [Layer(self.config) for _ in range(self.config.n_layers)]
         )
         self.embeddings = nn.Embedding(self.config.vocab_size, self.config.n_dim)
-        self.norms = nn.ModuleList(
-            [
-                nn.LayerNorm(normalized_shape=self.config.n_dim)
-                for _ in range(self.config.n_layers)
-            ]
-        )
+        self.norm = nn.LayerNorm(normalized_shape=self.config.n_dim)
         self.lm_head = nn.Linear(self.config.n_dim, self.config.vocab_size, bias=False)
 
         self.register_buffer("pos_idx", torch.arange(self.config.seq_len))
@@ -92,9 +97,10 @@ class LLM(nn.Module):
         x = self.embeddings(x)
         pos_tok = self.pos(self.pos_idx[:S])
         x = x + pos_tok
-        for l, norm in zip(self.layers, self.norms):
-            x = norm(l(x))
+        for l in self.layers:
+            x = l(x)
 
+        x = self.norm(x)
         x = self.lm_head(x)
         return x
 

@@ -1,6 +1,7 @@
 import glob
 import json
 import mmap
+import multiprocessing as mp
 import os
 import threading
 from queue import Empty, Queue
@@ -44,6 +45,49 @@ def check_tokenizer_config():
             return LLMConfig.vocab_size == config["vocab_size"]
     except:
         return False
+
+
+# Pool worker globals — populated by _worker_init in each child process.
+_TK = None
+_EOT = None
+
+
+def _worker_init(tokenizer_path: str) -> None:
+    """Pool worker setup. Force each worker to use a single Rayon thread so
+    process-level parallelism (the pool) doesn't fight thread-level parallelism
+    (the tokenizer's internal Rayon pool). With N workers × 1 thread we get
+    clean N-way parallelism; with N workers × 24 threads we'd thrash.
+
+    The env vars must be set BEFORE the Tokenizer is loaded — Rayon reads
+    RAYON_NUM_THREADS lazily on first thread-pool use, but once it's read the
+    value is sticky.
+    """
+    os.environ["RAYON_NUM_THREADS"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    global _TK, _EOT
+    _TK = Tokenizer.from_file(tokenizer_path)
+    _EOT = _TK.token_to_id("<|endoftext|>")
+
+
+def _worker_encode_batch(batch):
+    """Tokenize a chunk of (i, text) tuples. Returns a list of (i, np.uint32 array).
+
+    Each returned array carries the doc's tokens plus a trailing <|endoftext|>
+    separator. The tokenizer's TemplateProcessor already appends one EOT, so
+    each doc ends up with two consecutive EOTs in the shard — preserved here
+    to match the on-disk format the existing v1.4 shards used.
+    """
+    indices = [b[0] for b in batch]
+    texts = [b[1] for b in batch]
+    encs = _TK.encode_batch(texts)
+    out = []
+    for idx, enc in zip(indices, encs):
+        ids = enc.ids
+        arr = np.empty(len(ids) + 1, dtype=np.uint32)
+        arr[: len(ids)] = ids
+        arr[-1] = _EOT
+        out.append((idx, arr))
+    return out
 
 
 class ShardedTokenDataset:
@@ -426,13 +470,17 @@ if __name__ == "__main__":
         exit()
 
     SHARD_SIZE = 250_000_000  # ~1GB per shard at uint32
-    ENCODE_BATCH = 4000  # bumped from 1000 to give rayon more parallelism per call
-    FLUSH_EVERY = 20_000_000  # bumped to amortize numpy/tofile overhead
     VAL_EVERY = 1000
     STATUS_EVERY = 50_000  # high-level progress print every N docs
+    NPROCS = max(2, (os.cpu_count() or 4) - 2)
+    WORKER_BATCH = 64  # docs per task sent to a worker; amortizes IPC
 
     def encode_both_splits():
-        """Single pass over dataset, routing each doc to train or val shards."""
+        """Single pass over the dataset. The main process iterates the stream
+        and dispatches doc batches to a worker pool; workers tokenize in
+        parallel; the main process accumulates results into a preallocated
+        per-split shard buffer and writes full shards to disk.
+        """
         out_dir = "dataset/fineweb"
         os.makedirs(out_dir, exist_ok=True)
 
@@ -440,137 +488,129 @@ if __name__ == "__main__":
         print(
             f"[encode] shard size = {SHARD_SIZE:,} tokens (~{SHARD_SIZE * 4 / 1e9:.1f}GB each)"
         )
-        print(f"[encode] encode_batch = {ENCODE_BATCH}, flush_every = {FLUSH_EVERY:,}")
+        print(f"[encode] {NPROCS} workers, worker_batch = {WORKER_BATCH}")
         print(f"[encode] val ratio = 1/{VAL_EVERY}")
 
-        # Per-split state. Keeps the two outputs independent but lets us share
-        # the iteration over the source dataset.
+        # Per-split state. One preallocated SHARD_SIZE buffer; on overflow,
+        # write to disk and reset the cursor.
         state = {}
         for split in ("train", "val"):
-            path = os.path.join(out_dir, f"fineweb_{split}_0000.bin")
             state[split] = {
-                "buf": [],
-                "batch": [],
+                "buf": np.empty(SHARD_SIZE, dtype=np.uint32),
+                "n": 0,  # tokens written into the current shard buffer
                 "shard_idx": 0,
-                "shard_tokens": 0,
                 "total_tokens": 0,
-                "f": open(path, "wb"),
-                "path": path,
+                "path": os.path.join(out_dir, f"fineweb_{split}_0000.bin"),
             }
-            print(f"[encode] opened {path}")
+            print(f"[encode] {split} shard 0: {state[split]['path']}")
 
-        def open_shard(split, idx):
-            path = os.path.join(out_dir, f"fineweb_{split}_{idx:04d}.bin")
-            return open(path, "wb"), path
-
-        def flush_batch(split):
+        def flush_full(split):
             s = state[split]
-            if not s["batch"]:
-                return
-            t0 = time.time()
-            n_docs = len(s["batch"])
-            encs = tokenizer.encode_batch(s["batch"])
-            for enc in encs:
-                s["buf"].extend(enc.ids)
-                s["buf"].append(eot_id)
-            s["batch"].clear()
-            if split == "train":
-                dt = time.time() - t0
-                rate = n_docs / dt if dt > 0 else 0
-                print(
-                    f"  [encode/{split}] {n_docs} docs in {dt:.2f}s ({rate:.0f} docs/s)"
-                )
+            s["buf"].tofile(s["path"])
+            size_gb = os.path.getsize(s["path"]) / 1e9
+            print(
+                f"  [shard/{split}] FINISHED {s['path']} "
+                f"({s['n']:,} tokens, {size_gb:.2f}GB)"
+            )
+            s["shard_idx"] += 1
+            s["path"] = os.path.join(
+                out_dir, f"fineweb_{split}_{s['shard_idx']:04d}.bin"
+            )
+            s["n"] = 0
 
-        def flush_buf(split):
+        def append(split, arr):
+            """Append a doc's token array, splitting across shard boundaries
+            when needed. Doc ordering within a shard isn't meaningful for
+            pretraining, so the imap_unordered out-of-order delivery is fine.
+            """
             s = state[split]
-            if not s["buf"]:
-                return
-            t0 = time.time()
-            n_tokens = len(s["buf"])
             offset = 0
-            buf = s["buf"]
-            while offset < len(buf):
-                room = SHARD_SIZE - s["shard_tokens"]
-                chunk = buf[offset : offset + room]
-                np.array(chunk, dtype=np.uint32).tofile(s["f"])
-                s["shard_tokens"] += len(chunk)
-                s["total_tokens"] += len(chunk)
-                offset += len(chunk)
-                if s["shard_tokens"] >= SHARD_SIZE:
-                    s["f"].close()
-                    size_gb = os.path.getsize(s["path"]) / 1e9
-                    print(
-                        f"  [shard/{split}] FINISHED {s['path']} "
-                        f"({s['shard_tokens']:,} tokens, {size_gb:.2f}GB)"
-                    )
-                    s["shard_idx"] += 1
-                    s["f"], s["path"] = open_shard(split, s["shard_idx"])
-                    s["shard_tokens"] = 0
-                    print(f"  [shard/{split}] opened {s['path']}")
-            s["buf"].clear()
-            if split == "train":
-                dt = time.time() - t0
-                print(f"  [flush/{split}] wrote {n_tokens:,} tokens in {dt:.2f}s")
+            m = len(arr)
+            while offset < m:
+                room = SHARD_SIZE - s["n"]
+                chunk = (m - offset) if (m - offset) < room else room
+                s["buf"][s["n"] : s["n"] + chunk] = arr[offset : offset + chunk]
+                s["n"] += chunk
+                s["total_tokens"] += chunk
+                offset += chunk
+                if s["n"] >= SHARD_SIZE:
+                    flush_full(split)
+
+        def doc_batches():
+            """Yield (i, text) lists of size WORKER_BATCH from the dataset."""
+            batch = []
+            for i, ex in enumerate(dataset):
+                batch.append((i, ex["text"]))
+                if len(batch) >= WORKER_BATCH:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
 
         print(f"[encode] starting at {time.strftime('%H:%M:%S')}")
         t_start = time.time()
         last_status = t_start
         last_status_docs = 0
+        processed = 0
 
-        try:
-            for i, ex in enumerate(tqdm(dataset, desc="encoding")):
-                split = "val" if i % VAL_EVERY == 0 else "train"
-                s = state[split]
-                s["batch"].append(ex["text"])
-                if len(s["batch"]) >= ENCODE_BATCH:
-                    flush_batch(split)
-                if len(s["buf"]) >= FLUSH_EVERY:
-                    flush_buf(split)
+        # fork is the default on Linux and skips re-import overhead. The worker
+        # initializer pins each child to RAYON_NUM_THREADS=1 before it loads
+        # the tokenizer, so per-process Rayon doesn't oversubscribe the box.
+        ctx = mp.get_context("fork")
+        with ctx.Pool(
+            processes=NPROCS,
+            initializer=_worker_init,
+            initargs=(TOKENIZER_PATH,),
+        ) as pool:
+            try:
+                for results in pool.imap_unordered(
+                    _worker_encode_batch, doc_batches(), chunksize=2
+                ):
+                    for i, arr in results:
+                        split = "val" if i % VAL_EVERY == 0 else "train"
+                        append(split, arr)
+                        processed += 1
 
-                if (i + 1) % STATUS_EVERY == 0:
-                    now = time.time()
-                    interval_docs = (i + 1) - last_status_docs
-                    interval_dt = now - last_status
-                    rate = interval_docs / interval_dt if interval_dt > 0 else 0
-                    train_tok = state["train"]["total_tokens"] + len(
-                        state["train"]["buf"]
-                    )
-                    val_tok = state["val"]["total_tokens"] + len(state["val"]["buf"])
-                    elapsed_min = (now - t_start) / 60
+                        if processed % STATUS_EVERY == 0:
+                            now = time.time()
+                            interval_docs = processed - last_status_docs
+                            interval_dt = now - last_status
+                            rate = (
+                                interval_docs / interval_dt if interval_dt > 0 else 0
+                            )
+                            elapsed_min = (now - t_start) / 60
+                            print(
+                                f"[status] doc {processed:,} | {rate:.0f} docs/s | "
+                                f"elapsed {elapsed_min:.1f}min | "
+                                f"train={state['train']['total_tokens']:,} tok "
+                                f"({state['train']['shard_idx'] + 1} shards) | "
+                                f"val={state['val']['total_tokens']:,} tok "
+                                f"({state['val']['shard_idx'] + 1} shards)"
+                            )
+                            last_status = now
+                            last_status_docs = processed
+                print(f"[encode] stream exhausted")
+            finally:
+                print(f"[encode] finalizing...")
+                for split, s in state.items():
+                    if s["n"] > 0:
+                        s["buf"][: s["n"]].tofile(s["path"])
+                        size_gb = os.path.getsize(s["path"]) / 1e9
+                        print(
+                            f"  [shard/{split}] FINISHED {s['path']} "
+                            f"({s['n']:,} tokens, {size_gb:.2f}GB)"
+                        )
                     print(
-                        f"[status] doc {i + 1:,} | {rate:.0f} docs/s | "
-                        f"elapsed {elapsed_min:.1f}min | "
-                        f"train={train_tok:,} tok ({state['train']['shard_idx'] + 1} shards) | "
-                        f"val={val_tok:,} tok ({state['val']['shard_idx'] + 1} shards)"
+                        f"[done/{split}] {s['total_tokens']:,} tokens "
+                        f"across {s['shard_idx'] + 1} shard(s)"
                     )
-                    last_status = now
-                    last_status_docs = i + 1
 
-            print(f"[encode] stream exhausted, draining buffers...")
-            for split in state:
-                flush_batch(split)
-                flush_buf(split)
-        finally:
-            print(f"[encode] finalizing...")
-            for split, s in state.items():
-                if not s["f"].closed:
-                    s["f"].close()
-                    size_gb = os.path.getsize(s["path"]) / 1e9
-                    print(
-                        f"  [shard/{split}] FINISHED {s['path']} "
-                        f"({s['shard_tokens']:,} tokens, {size_gb:.2f}GB)"
-                    )
+                total_dt = time.time() - t_start
+                total_tok = sum(s["total_tokens"] for s in state.values())
+                rate_m = total_tok / total_dt / 1e6 if total_dt > 0 else 0
                 print(
-                    f"[done/{split}] {s['total_tokens']:,} tokens "
-                    f"across {s['shard_idx'] + 1} shard(s)"
+                    f"[done] total: {total_tok:,} tokens in {total_dt / 60:.1f} min "
+                    f"({rate_m:.2f}M tok/s)"
                 )
-
-            total_dt = time.time() - t_start
-            total_tok = sum(s["total_tokens"] for s in state.values())
-            rate_m = total_tok / total_dt / 1e6 if total_dt > 0 else 0
-            print(
-                f"[done] total: {total_tok:,} tokens in {total_dt / 60:.1f} min "
-                f"({rate_m:.2f}M tok/s)"
-            )
 
     encode_both_splits()

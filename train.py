@@ -20,15 +20,15 @@ val_dataset = ShardedTokenDataset("val")
 
 @dataclass
 class TrainConfig:
-    RUN_NAME: str = "v1.4"
+    RUN_NAME: str = "v1.5"
     epochs = 10
-    train_steps = 4000
+    train_steps = 4500
     val_steps = 100
-    batch_size = 512
+    batch_size = 64
     val_interval = 1  # Epoch between val intervals
-    peak_lr: float = 5e-5
+    peak_lr: float = 1e-4
     lr_warmup: int = 200
-    min_lr_ratio: float = 0.1
+    min_lr_ratio: float = 0.2
 
 
 def train(model, train_dataloader, val_dataloader, train_config):
@@ -130,7 +130,7 @@ def train(model, train_dataloader, val_dataloader, train_config):
         val_ppl = math.exp(avg_val_l)
 
         print(
-            f"Epoch {epoch}: Train CE {avg_train_l:.4f} PPL {train_ppl:.2f} Acc {1 - (train_ppl / model.config.vocab_size):.2f} |"
+            f"Epoch {epoch}: Train CE {avg_train_l:.4f} PPL {train_ppl:.2f} Acc {1 - (train_ppl / model.config.vocab_size):.5f} |"
             f" Val CE {avg_val_l:.4f} PPL {val_ppl:.2f} Acc {1 - (val_ppl / model.config.vocab_size):.2f}"
         )
         losses.append(avg_train_l)
