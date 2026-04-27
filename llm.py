@@ -8,8 +8,9 @@ import torch.nn.functional as F
 
 @dataclass
 class LLMConfig:
-    n_dim = 64  # Dimensions of the token vectors
+    n_dim = 128  # Dimensions of the token vectors
     n_layers = 10  # Number of layers in the language model
+    n_heads = 8
     vocab_size = 1024  # Number of unique tokens
     seq_len = 128  # Context length
 
@@ -24,25 +25,26 @@ class Layer(nn.Module):
             nn.ReLU(),
             nn.Linear(self.config.n_dim * 4, self.config.n_dim),
         )
-        self.register_buffer(
-            "mask",
-            torch.triu(
-                torch.ones(
-                    self.config.seq_len,
-                    self.config.seq_len,
-                    dtype=torch.bool,
-                ),
-                diagonal=1,
-            ),
-        )
+        # self.register_buffer(
+        #     "mask",
+        #     torch.triu(
+        #         torch.ones(
+        #             self.config.seq_len,
+        #             self.config.seq_len,
+        #             dtype=torch.bool,
+        #         ),
+        #         diagonal=1,
+        #     ),
+        # )
 
     def forward(self, x):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         T = q.size(-2)
-        scores = (q @ k.transpose(-1, -2)) * self.config.n_dim**-0.5
-        scores = scores.masked_fill(self.mask[:T, :T], float("-inf"))
-        attn = F.softmax(scores, dim=-1)
-        out = x + attn @ v
+        # scores = (q @ k.transpose(-1, -2)) * self.config.n_dim**-0.5
+        # scores = scores.masked_fill(self.mask[:T, :T], float("-inf"))
+        # attn = F.softmax(scores, dim=-1)
+        # out = x + attn @ v
+        out = x + F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out + self.ffn(out)
         return out
 

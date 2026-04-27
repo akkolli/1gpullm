@@ -22,11 +22,11 @@ val_dataset = ShardedTokenDataset("val")
 class TrainConfig:
     RUN_NAME: str = "v1.4"
     epochs = 10
-    train_steps = 7000
+    train_steps = 4000
     val_steps = 100
     batch_size = 512
     val_interval = 1  # Epoch between val intervals
-    peak_lr: float = 3e-4
+    peak_lr: float = 5e-5
     lr_warmup: int = 200
     min_lr_ratio: float = 0.1
 
