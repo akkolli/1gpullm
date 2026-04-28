@@ -7,8 +7,9 @@ from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
+from torch.optim import AdamW, Muon
 from torch.optim.lr_scheduler import LambdaLR
+from torchao.float8 import convert_to_float8_training
 from tqdm import tqdm
 
 from llm import LLM, LLMConfig, param_breakdown
@@ -20,15 +21,18 @@ val_dataset = ShardedTokenDataset("val")
 
 @dataclass
 class TrainConfig:
-    RUN_NAME: str = "v1.6"
-    epochs = 10
-    train_steps = 500
-    val_steps = 100
-    batch_size = 192
-    val_interval = 1  # Epoch between val intervals
-    peak_lr: float = 1e-3
-    lr_warmup: int = 1
-    min_lr_ratio: float = 0.2
+    RUN_NAME: str = "v1.8:mega"
+    epochs: int = 40
+    train_steps: int = 2200
+    val_steps: int = 100
+    batch_size: int = 176
+    val_interval: int = 1  # Epoch between val intervals
+    peak_lr: float = 5e-4
+    lr_warmup: int = 4000
+    min_lr_ratio: float = 0.1
+    # z-loss penalizes the softmax partition function magnitude. Stabilizes
+    # bf16 logits and lets us push LR up. PaLM used 1e-4.
+    z_loss_coeff: float = 1e-4
 
 
 def train(model, train_dataloader, val_dataloader, train_config):
@@ -36,14 +40,52 @@ def train(model, train_dataloader, val_dataloader, train_config):
 
     model = model.to("cuda")
     total_params = param_breakdown(model)
+
+    def fp8_filter(module, fqn: str) -> bool:
+        return "lm_head" not in fqn and "embed" not in fqn and "pos" not in fqn
+
+    convert_to_float8_training(model, module_filter_fn=fp8_filter)
+
     model = torch.compile(model, mode="reduce-overhead")
-    optimizer = AdamW(
-        model.parameters(),
+
+    # Muon goes on 2D hidden weights only. Embeddings (lookup, sparse-ish),
+    # the tied lm_head, positional embeddings, and norms (1D) need AdamW.
+    muon_params, adam_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_2d_hidden = (
+            p.ndim == 2
+            and "embeddings" not in name
+            and "lm_head" not in name
+            and "pos" not in name
+            and "norm" not in name
+        )
+        (muon_params if is_2d_hidden else adam_params).append(p)
+    print(
+        f"[opt] Muon: {sum(p.numel() for p in muon_params):,} params "
+        f"across {len(muon_params)} tensors | "
+        f"AdamW: {sum(p.numel() for p in adam_params):,} params "
+        f"across {len(adam_params)} tensors"
+    )
+
+    # match_rms_adamw scales Muon's update RMS to match AdamW, so we can reuse
+    # the AdamW LR (peak_lr) for both — no separate Muon LR to tune.
+    opt_muon = Muon(
+        muon_params,
+        lr=train_config.peak_lr,
+        weight_decay=0.1,
+        momentum=0.95,
+        adjust_lr_fn="match_rms_adamw",
+    )
+    opt_adam = AdamW(
+        adam_params,
         lr=train_config.peak_lr,
         betas=(0.9, 0.95),
         weight_decay=0.1,
         fused=True,
     )
+    optimizers = [opt_muon, opt_adam]
     losses = []
     val_losses = []
     check_point_path = f"./checkpoints/{train_config.RUN_NAME}"
@@ -60,7 +102,7 @@ def train(model, train_dataloader, val_dataloader, train_config):
             1 + math.cos(math.pi * progress)
         )
 
-    scheduler = LambdaLR(optimizer, lr_lamda)
+    schedulers = [LambdaLR(o, lr_lamda) for o in optimizers]
     tokens_per_step = train_config.batch_size * model.config.seq_len
     tokens_covered = tokens_per_step * train_config.train_steps * train_config.epochs
     total_tokens = train_dataloader.total_tokens
@@ -83,6 +125,7 @@ def train(model, train_dataloader, val_dataloader, train_config):
             epoch_start = time.perf_counter()
 
         loss_accum = torch.zeros((), device="cuda")
+        z_accum = torch.zeros((), device="cuda")
         for step in tqdm(range(train_config.train_steps)):
             if is_last_epoch:
                 torch.cuda.synchronize()
@@ -99,21 +142,30 @@ def train(model, train_dataloader, val_dataloader, train_config):
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 preds = model(x)
-                loss = F.cross_entropy(preds.view(-1, preds.size(-1)), y.view(-1))
+                flat = preds.view(-1, preds.size(-1))
+                ce = F.cross_entropy(flat, y.view(-1))
+                # All bf16. fp32 cast here would double the backward grad on
+                # `flat` to 4.8GB at this batch size. logsumexp's max-shift
+                # keeps bf16 numerically fine for the aux-loss purpose.
+                log_z = torch.logsumexp(flat, dim=-1)
+                z = (log_z * log_z).mean()
+                loss = ce + train_config.z_loss_coeff * z
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            # x.to("cpu")
-            # y.to("cpu")
+            for o in optimizers:
+                o.step()
+            for s in schedulers:
+                s.step()
+            for o in optimizers:
+                o.zero_grad()
 
             if is_last_epoch:
                 torch.cuda.synchronize()
                 model_total += time.perf_counter() - t_model_start
 
-            loss_accum += loss.detach()
+            loss_accum += ce.detach()
+            z_accum += z.detach()
 
         if is_last_epoch:
             torch.cuda.synchronize()
@@ -133,13 +185,15 @@ def train(model, train_dataloader, val_dataloader, train_config):
         model.train()
 
         avg_train_l = loss_accum.item() / train_config.train_steps
+        avg_z = z_accum.item() / train_config.train_steps
         avg_val_l = val_loss / train_config.val_steps
         train_ppl = math.exp(avg_train_l)
         val_ppl = math.exp(avg_val_l)
 
         print(
             f"Epoch {epoch}: Train CE {avg_train_l:.4f} PPL {train_ppl:.2f} Acc {1 - (train_ppl / model.config.vocab_size):.5f} |"
-            f" Val CE {avg_val_l:.4f} PPL {val_ppl:.2f} Acc {1 - (val_ppl / model.config.vocab_size):.2f}"
+            f" Val CE {avg_val_l:.4f} PPL {val_ppl:.2f} Acc {1 - (val_ppl / model.config.vocab_size):.2f} |"
+            f" z={avg_z:.3f}"
         )
         losses.append(avg_train_l)
         val_losses.append(avg_val_l)

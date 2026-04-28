@@ -11,16 +11,15 @@ prompt-without-continuation for LM), tokenize them, then score:
   - multiple_choice: pick the choice with the lowest mean per-token loss
                      (length-normalized log-likelihood under teacher forcing)
   - schema:          same scoring, common span is the suffix
-  - language_modeling: autoregressive greedy generation (LLM.generate, T=0)
-                       must reproduce every continuation token exactly
+  - language_modeling: teacher-forced argmax over the continuation must equal
+                       every gold continuation token (single forward pass).
 
-Note: nanochat's reference uses teacher-forced argmax for LM tasks (one
-forward pass per example). We instead drive the model's own generate()
-since the next steps in this project are SFT and RLHF, where greedy
-generation is the common eval primitive. For a perfect model the two
-are equivalent; for an imperfect model autoregressive generation is the
-stricter test (errors compound across positions instead of being scored
-independently).
+Aligns with nanochat's scoring so CORE numbers are directly comparable.
+Common-prefix length (not strict prefix equality) is used to delimit the
+continuation, which is necessary for byte-level BPE — the boundary token
+between the prompt and its continuation often differs between the two
+encodings (e.g. encode("...the ") vs encode("...the apple") diverge at
+" apple" being a single merged token).
 
 Per-task accuracy is centered against a published random baseline:
   centered = (acc - r) / (1 - r)
@@ -260,32 +259,33 @@ def evaluate_example(idx, model, tk, data, device, task_meta, max_seq_len):
 
 @torch.no_grad()
 def _eval_lm(model, tk, item, delim, fewshot, device, max_seq_len):
-    """LM-task scoring: autoregressive greedy generation must match the gold
-    continuation token-for-token. Uses model.generate(temperature=0)."""
+    """LM-task scoring: teacher-forced argmax over the gold continuation in a
+    single forward pass. Common-prefix length handles BPE boundary tokens
+    where encode(prompt) is not a strict prefix of encode(prompt+continuation).
+    """
     prompt_without, prompt_with = render_prompts_lm(item, delim, fewshot)
     t_without, t_with = tk.encode_many([prompt_without, prompt_with], prepend_id=tk.eot_id)
-    # tokenizer must produce a clean token-level prefix split — otherwise we
-    # can't tell where the continuation starts. (Rare edge cases at BPE
-    # boundaries; treat as wrong.)
-    if not (len(t_without) < len(t_with) and t_with[: len(t_without)] == t_without):
+
+    common = find_common_length([t_without, t_with], "left")
+    if common == 0 or common >= len(t_with):
         return False
 
-    gold_continuation = t_with[len(t_without) :]
-    n_new = len(gold_continuation)
-    if n_new == 0:
-        return True
+    # left-truncate to fit the model's context, shifting `common` along
+    if len(t_with) > max_seq_len:
+        crop = len(t_with) - max_seq_len
+        t_with = t_with[crop:]
+        common -= crop
+        if common < 1:
+            return False
 
-    # crop the prompt itself to fit max_seq_len. generate() also re-crops
-    # internally each step, but starting with a too-long prompt would still
-    # waste a forward pass on garbage context.
-    prompt = t_without[-max_seq_len:] if len(t_without) > max_seq_len else t_without
-    if not prompt:  # would otherwise call forward on an empty tensor
-        return False
-
-    prompt_t = torch.tensor([prompt], dtype=torch.long, device=device)
-    out = model.generate(prompt_t, max_new_tokens=n_new, temperature=0.0)
-    generated = out[0, -n_new:].tolist()
-    return generated == gold_continuation
+    input_ids = torch.tensor([t_with], dtype=torch.long, device=device)
+    _, preds = forward_model(model, input_ids)
+    # preds[t] = argmax of logits at position t, predicting token at t+1.
+    # Continuation tokens are at positions [common, len(t_with)); their
+    # predictions come from logits at positions [common-1, len(t_with)-1).
+    pred_continuation = preds[0, common - 1 : len(t_with) - 1].tolist()
+    gold_continuation = t_with[common:]
+    return pred_continuation == gold_continuation
 
 
 def evaluate_task(model, tk, data, device, task_meta, max_seq_len):

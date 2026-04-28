@@ -11,7 +11,7 @@ import torch
 
 # Set thread environment vars BEFORE importing tokenizers — the Rust extension
 # reads these at load time and they're sticky after that.
-os.environ["RAYON_NUM_THREADS"] = "24"
+os.environ["RAYON_NUM_THREADS"] = "16"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import time
@@ -28,6 +28,16 @@ from llm import LLMConfig
 MAX_DOCS = 100_000
 TOKENIZER_PATH = "tokenizer/tokenizer.json"
 TOKENIZER_CONFIG_PATH = "tokenizer/tokenizer_config.json"
+
+DATASET_NAME = "OptimalScale/ClimbMix"
+DATASET_SLUG = DATASET_NAME.split("/")[-1].lower()
+# Reservoir size for the streaming shuffle. The HF IterableDataset.shuffle
+# fills this buffer then yields random elements from it, refilling as it
+# drains — so a doc at stream position p ends up roughly uniformly placed
+# within a window of width ~SHUFFLE_BUFFER. Big enough to break local
+# topic/source clustering in ClimbMix; small enough to fit in RAM.
+SHUFFLE_BUFFER = 50_000
+SHUFFLE_SEED = 42
 
 
 def dataset_iterator():
@@ -105,8 +115,16 @@ class ShardedTokenDataset:
     windows are statistically independent enough for pretraining.
     """
 
-    def __init__(self, split: str, data_dir: str = "dataset/fineweb", dtype=np.uint32):
-        pattern = os.path.join(data_dir, f"fineweb_{split}_*.bin")
+    def __init__(
+        self,
+        split: str,
+        data_dir: str | None = None,
+        dataset_slug: str = DATASET_SLUG,
+        dtype=np.uint32,
+    ):
+        if data_dir is None:
+            data_dir = os.path.join("dataset", dataset_slug)
+        pattern = os.path.join(data_dir, f"{dataset_slug}_{split}_*.bin")
         paths = sorted(glob.glob(pattern))
         if not paths:
             raise FileNotFoundError(f"no shards matched {pattern}")
@@ -205,12 +223,22 @@ class ShardedTokenDataset:
     ) -> None:
         """Advance cursor and copy one (B*T + 1)-token contiguous slice."""
         n = batch_size * context_len
-        sid = int(self._shard_order[self._cursor_shard_pos])
-        shard = self.shards[sid]
-        if self._cursor_offset + n + 1 > len(shard):
-            self._advance_shard(rng)
+        # Loop because a single advance may land on another shard that's also
+        # too small (e.g. the leftover tail shard from the encode cap).
+        attempts = 0
+        max_attempts = 2 * len(self.shards) + 2
+        while True:
             sid = int(self._shard_order[self._cursor_shard_pos])
             shard = self.shards[sid]
+            if self._cursor_offset + n + 1 <= len(shard):
+                break
+            self._advance_shard(rng)
+            attempts += 1
+            if attempts > max_attempts:
+                raise RuntimeError(
+                    f"no shard large enough for batch ({n + 1} tokens); "
+                    f"shard sizes={self.lengths.tolist()}"
+                )
         i = self._cursor_offset
         np.copyto(
             x_np, shard[i : i + n].reshape(batch_size, context_len), casting="unsafe"
@@ -286,34 +314,43 @@ class ShardedTokenDataset:
     ) -> None:
         rng = np.random.default_rng()
         slot_idx = 0
-        while not self._prefetch_stop.is_set():
-            slot = slots[slot_idx]
-            slot_idx = (slot_idx + 1) % len(slots)
-            # Block CPU until the previous DMA reading from this pinned buffer
-            # is done. Without this we'd race: producer overwrites bytes the
-            # GPU is still copying out.
-            if slot["event"] is not None:
-                slot["event"].synchronize()
-
-            self._fill_one(slot["x_np"], slot["y_np"], batch_size, context_len, rng)
-
-            # Async H2D, then record an event so the consumer's stream can
-            # wait on it. Issued from this thread; the event carries the
-            # ordering across threads.
-            x_gpu = slot["x_pin"].to(device, non_blocking=True)
-            y_gpu = slot["y_pin"].to(device, non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record()
-            slot["event"] = ev
-
-            # Bounded queue: producer blocks here once it's `queue_size` ahead.
-            # Use timeout so we periodically re-check the stop flag.
+        try:
             while not self._prefetch_stop.is_set():
-                try:
-                    self._prefetch_ready.put((x_gpu, y_gpu, ev), timeout=0.5)
-                    break
-                except Exception:
-                    continue
+                slot = slots[slot_idx]
+                slot_idx = (slot_idx + 1) % len(slots)
+                # Block CPU until the previous DMA reading from this pinned buffer
+                # is done. Without this we'd race: producer overwrites bytes the
+                # GPU is still copying out.
+                if slot["event"] is not None:
+                    slot["event"].synchronize()
+
+                self._fill_one(slot["x_np"], slot["y_np"], batch_size, context_len, rng)
+
+                # Async H2D, then record an event so the consumer's stream can
+                # wait on it. Issued from this thread; the event carries the
+                # ordering across threads.
+                x_gpu = slot["x_pin"].to(device, non_blocking=True)
+                y_gpu = slot["y_pin"].to(device, non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record()
+                slot["event"] = ev
+
+                # Bounded queue: producer blocks here once it's `queue_size` ahead.
+                # Use timeout so we periodically re-check the stop flag.
+                while not self._prefetch_stop.is_set():
+                    try:
+                        self._prefetch_ready.put((x_gpu, y_gpu, ev), timeout=0.5)
+                        break
+                    except Exception:
+                        continue
+        except BaseException as e:
+            # Surface failures to the consumer instead of letting it block
+            # forever on Queue.get. The sentinel carries the original exception.
+            try:
+                self._prefetch_ready.put(("__error__", e, None), timeout=5.0)
+            except Exception:
+                pass
+            raise
 
     def get_batch(
         self,
@@ -339,6 +376,8 @@ class ShardedTokenDataset:
                 self._start_prefetch(batch_size, context_len, device)
 
             x_gpu, y_gpu, ev = self._prefetch_ready.get()
+            if isinstance(x_gpu, str) and x_gpu == "__error__":
+                raise RuntimeError("prefetch thread crashed") from y_gpu
             # Make the consumer's current stream wait for the H2D event. The
             # CPU returns immediately; the next op on this stream (model
             # forward) will be ordered after the copy.
@@ -363,10 +402,15 @@ if __name__ == "__main__":
     print(f"[init] rayon threads = {os.environ['RAYON_NUM_THREADS']}")
     print(f"[init] loading dataset...")
 
-    dataset = load_dataset(
-        "HuggingFaceFW/fineweb", name="sample-10BT", streaming=True, split="train"
-    )
-    print(f"[init] dataset ready")
+    dataset = load_dataset(DATASET_NAME, streaming=True, split="train")
+    # Reservoir-shuffle at the stream level. ClimbMix is grouped by source on
+    # disk, so a raw sequential read produces highly homogeneous train and
+    # val sets (val especially: every VAL_EVERY-th doc lands in the same
+    # cluster as its neighbors). Shuffling here mixes the order before the
+    # encode loop sees it, so the cap-truncated prefix is a uniform sample
+    # over (approximately) a SHUFFLE_BUFFER-wide window.
+    dataset = dataset.shuffle(seed=SHUFFLE_SEED, buffer_size=SHUFFLE_BUFFER)
+    print(f"[init] dataset ready (shuffled, buffer={SHUFFLE_BUFFER:,})")
 
     # If tokenizer does not exist, make one
     if not os.path.exists(TOKENIZER_PATH) or not check_tokenizer_config():
@@ -406,7 +450,7 @@ if __name__ == "__main__":
         ]
         trainer = BpeTrainer(
             vocab_size=LLMConfig.vocab_size,
-            min_frequency=2,
+            min_frequency=10,
             special_tokens=SPECIALS,
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             show_progress=True,
@@ -467,7 +511,9 @@ if __name__ == "__main__":
         )
 
     SHARD_SIZE = 250_000_000  # ~1GB per shard at uint32
-    MAX_TRAIN_TOKENS = 1_000_000_000  # ~10% of fineweb sample-10BT; ~3x training headroom
+    MAX_TRAIN_TOKENS = (
+        4_000_000_000  # ~10% of fineweb sample-10BT; ~3x training headroom
+    )
     VAL_EVERY = 1000
     STATUS_EVERY = 50_000  # high-level progress print every N docs
     # 8 workers is plenty for tokenization throughput. Higher counts blew up
@@ -481,12 +527,12 @@ if __name__ == "__main__":
         parallel; the main process accumulates results into a preallocated
         per-split shard buffer and writes full shards to disk.
         """
-        out_dir = "dataset/fineweb"
+        out_dir = os.path.join("dataset", DATASET_SLUG)
         os.makedirs(out_dir, exist_ok=True)
 
         # Wipe any prior shards so a smaller re-run can't leave stale tail
         # shards lying around from a previous larger encode.
-        stale = sorted(glob.glob(os.path.join(out_dir, "fineweb_*.bin")))
+        stale = sorted(glob.glob(os.path.join(out_dir, f"{DATASET_SLUG}_*.bin")))
         if stale:
             print(f"[encode] removing {len(stale)} stale shard file(s)")
             for p in stale:
@@ -496,7 +542,9 @@ if __name__ == "__main__":
         print(
             f"[encode] shard size = {SHARD_SIZE:,} tokens (~{SHARD_SIZE * 4 / 1e9:.1f}GB each)"
         )
-        print(f"[encode] cap = {MAX_TRAIN_TOKENS:,} train tokens (~{MAX_TRAIN_TOKENS * 4 / 1e9:.1f}GB)")
+        print(
+            f"[encode] cap = {MAX_TRAIN_TOKENS:,} train tokens (~{MAX_TRAIN_TOKENS * 4 / 1e9:.1f}GB)"
+        )
         print(f"[encode] {NPROCS} workers, worker_batch = {WORKER_BATCH}")
         print(f"[encode] val ratio = 1/{VAL_EVERY}")
 
@@ -509,7 +557,7 @@ if __name__ == "__main__":
                 "n": 0,  # tokens written into the current shard buffer
                 "shard_idx": 0,
                 "total_tokens": 0,
-                "path": os.path.join(out_dir, f"fineweb_{split}_0000.bin"),
+                "path": os.path.join(out_dir, f"{DATASET_SLUG}_{split}_0000.bin"),
             }
             print(f"[encode] {split} shard 0: {state[split]['path']}")
 
@@ -523,7 +571,7 @@ if __name__ == "__main__":
             )
             s["shard_idx"] += 1
             s["path"] = os.path.join(
-                out_dir, f"fineweb_{split}_{s['shard_idx']:04d}.bin"
+                out_dir, f"{DATASET_SLUG}_{split}_{s['shard_idx']:04d}.bin"
             )
             s["n"] = 0
 
