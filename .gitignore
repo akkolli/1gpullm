@@ -5,9 +5,19 @@ build/
 dist/
 wheels/
 *.egg-info
+*.swp
+.claude/
 
 # Virtual environments
 .venv
+
+# Local generated artifacts
 dataset/
 tokenizer/
+checkpoints/
+eval_bundle/
+eval_bundle.zip
 *.pth
+*.pt
+*.pkl
+*.png
