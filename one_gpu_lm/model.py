@@ -103,6 +103,7 @@ class LLM(nn.Module):
         targets: torch.Tensor | None = None,
         z_loss_coef: float = 0.0,
         loss_chunk_size: int = 8192,
+        ignore_index: int | None = None,
     ) -> torch.Tensor:
         x = self.embeddings(x)
         for block in self.layers:
@@ -116,6 +117,7 @@ class LLM(nn.Module):
             targets,
             z_loss_coef,
             loss_chunk_size,
+            ignore_index,
         )
 
     def run_block(self, block: TransformerBlock, x: torch.Tensor) -> torch.Tensor:
@@ -196,19 +198,98 @@ class ChunkedLMLoss(torch.autograd.Function):
         return grad_hidden, grad_weight.to(weight.dtype), None, None, None
 
 
+class MaskedChunkedLMLoss(torch.autograd.Function):
+    """Chunked LM loss variant that skips ignored target positions."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, target, z_coef, chunk_size, ignore_index):
+        ctx.save_for_backward(hidden, weight, target)
+        ctx.z_coef = float(z_coef)
+        ctx.chunk_size = int(chunk_size)
+        ctx.ignore_index = int(ignore_index)
+        ctx.valid_count = int((target != ctx.ignore_index).sum().item())
+
+        if ctx.valid_count == 0:
+            return torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+        loss_sum = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        z_sum = torch.zeros_like(loss_sum)
+        for start, end in chunks(hidden.size(0), ctx.chunk_size):
+            chunk_target = target[start:end]
+            valid = chunk_target != ctx.ignore_index
+            if not valid.any():
+                continue
+            chunk_hidden = hidden[start:end][valid]
+            logits = chunk_hidden @ weight.t()
+            log_z = torch.logsumexp(logits.float(), dim=-1)
+            target_logits = logits.float().gather(1, chunk_target[valid].unsqueeze(1))
+            target_logits = target_logits.squeeze(1)
+            loss_sum = loss_sum + (log_z - target_logits).sum()
+            z_sum = z_sum + log_z.square().sum()
+        return loss_sum / ctx.valid_count + ctx.z_coef * z_sum / ctx.valid_count
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        hidden, weight, target = ctx.saved_tensors
+        grad_hidden = torch.zeros_like(hidden)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+
+        if ctx.valid_count == 0:
+            return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None
+
+        ce_scale = grad_out / ctx.valid_count
+        z_scale = grad_out * ctx.z_coef / ctx.valid_count
+
+        for start, end in chunks(hidden.size(0), ctx.chunk_size):
+            chunk_target = target[start:end]
+            valid = chunk_target != ctx.ignore_index
+            if not valid.any():
+                continue
+            valid_rows = valid.nonzero(as_tuple=False).flatten()
+            valid_target = chunk_target[valid_rows]
+            chunk_hidden = hidden[start:end][valid_rows]
+
+            logits = (chunk_hidden @ weight.t()).float()
+            log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+            probs = (logits - log_z).exp()
+            grad_logits = probs * ce_scale
+            rows = torch.arange(valid_target.numel(), device=hidden.device)
+            grad_logits[rows, valid_target] -= ce_scale.to(grad_logits.dtype)
+            grad_logits.add_(probs * (2.0 * log_z * z_scale))
+            grad_logits = grad_logits.to(weight.dtype)
+
+            grad_chunk = grad_logits @ weight
+            grad_hidden[start:end].index_copy_(0, valid_rows, grad_chunk)
+            grad_weight.add_(grad_logits.t().float() @ chunk_hidden.float())
+
+        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None
+
+
 def chunked_lm_loss(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     targets: torch.Tensor,
     z_coef: float = 0.0,
     chunk_size: int = 8192,
+    ignore_index: int | None = None,
 ) -> torch.Tensor:
     """Return scalar LM loss for `hidden: [batch, seq, dim]`."""
 
+    hidden = hidden.reshape(-1, hidden.size(-1))
+    targets = targets.reshape(-1)
+    if ignore_index is not None:
+        return MaskedChunkedLMLoss.apply(
+            hidden,
+            weight,
+            targets,
+            z_coef,
+            chunk_size,
+            ignore_index,
+        )
     return ChunkedLMLoss.apply(
-        hidden.reshape(-1, hidden.size(-1)),
+        hidden,
         weight,
-        targets.reshape(-1),
+        targets,
         z_coef,
         chunk_size,
     )

@@ -29,6 +29,40 @@ class ChunkedLMLossTest(unittest.TestCase):
         self.assertTrue(torch.allclose(hidden.grad, ref_hidden.grad, atol=1e-6, rtol=1e-6))
         self.assertTrue(torch.allclose(weight.grad, ref_weight.grad, atol=1e-6, rtol=1e-6))
 
+    def test_ignore_index_matches_reference_loss_and_gradients(self):
+        torch.manual_seed(0)
+        hidden = torch.randn(2, 5, 7, requires_grad=True)
+        weight = torch.randn(11, 7, requires_grad=True)
+        targets = torch.randint(0, 11, (2, 5))
+        targets[0, 1] = -100
+        targets[1, 3] = -100
+
+        ref_hidden = hidden.detach().clone().requires_grad_()
+        ref_weight = weight.detach().clone().requires_grad_()
+
+        actual = chunked_lm_loss(
+            hidden,
+            weight,
+            targets,
+            z_coef=1e-4,
+            chunk_size=3,
+            ignore_index=-100,
+        )
+        logits = ref_hidden @ ref_weight.t()
+        flat_logits = logits.reshape(-1, 11)
+        flat_targets = targets.reshape(-1)
+        valid = flat_targets != -100
+        log_z = torch.logsumexp(flat_logits[valid].float(), dim=-1)
+        expected = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
+        expected = expected + 1e-4 * log_z.square().mean()
+
+        actual.backward()
+        expected.backward()
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(hidden.grad, ref_hidden.grad, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(weight.grad, ref_weight.grad, atol=1e-6, rtol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()

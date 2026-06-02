@@ -19,6 +19,7 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         compile_model=not args.no_compile,
         checkpoint_interval=args.checkpoint_interval,
+        mfu_peak_tflops=args.mfu_peak_tflops,
     )
     train(
         LLM(LLMConfig(gradient_checkpointing=cfg.gradient_checkpointing)),
@@ -40,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=("bf16", "fp8"), default=cfg.precision)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--checkpoint-interval", type=int, default=cfg.checkpoint_interval)
+    parser.add_argument(
+        "--mfu-peak-tflops",
+        type=float,
+        default=cfg.mfu_peak_tflops,
+        help="override the built-in RTX 5090 precision-specific peak TFLOPS",
+    )
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()

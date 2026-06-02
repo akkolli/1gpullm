@@ -19,6 +19,14 @@ from .checkpoint import (
 from .model import LLM, param_breakdown
 
 
+DEFAULT_GPU_NAME = "GeForce RTX 5090"
+# Dense Tensor Core peak rates. Change this mapping for a different GPU.
+GPU_PEAK_TFLOPS_BY_PRECISION = {
+    "bf16": 209.5,
+    "fp8": 838.0,
+}
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     """Single-run training configuration.
@@ -29,10 +37,10 @@ class TrainConfig:
     """
 
     run_name: str = "v1.9"
-    epochs: int = 40
-    train_steps: int = 3000
+    epochs: int = 80
+    train_steps: int = 1500
     val_steps: int = 50
-    batch_size: int = 32
+    batch_size: int = 64
     val_interval: int = 1
     peak_lr: float = 5e-4
     lr_warmup: int = 6000
@@ -42,6 +50,8 @@ class TrainConfig:
     precision: str = "fp8"
     compile_model: bool = True
     checkpoint_interval: int = 1
+    # Set > 0 to override GPU_PEAK_TFLOPS_BY_PRECISION.
+    mfu_peak_tflops: float = 0.0
 
     @property
     def out_dir(self) -> Path:
@@ -68,6 +78,8 @@ def train(
     seq_len = model.config.seq_len
     model = model.cuda()
     total_params = param_breakdown(model)
+    flops_per_token = estimate_training_flops_per_token(model, total_params)
+    mfu_peak_tflops = resolve_mfu_peak_tflops(cfg.precision, cfg.mfu_peak_tflops)
     # Convert precision before compile so Dynamo traces the final module graph.
     apply_precision(model, cfg.precision)
     if cfg.compile_model:
@@ -92,12 +104,15 @@ def train(
             schedulers,
             device="cuda",
         )
+    ensure_history_keys(history)
 
     tokens_per_step = cfg.batch_size * seq_len
     tokens_seen = tokens_per_step * cfg.total_steps
     print(
         f"[train] {tokens_seen / 1e6:.1f}M tokens, "
-        f"{tokens_seen / total_params:.2f} tok/param"
+        f"{tokens_seen / total_params:.2f} tok/param, "
+        f"{format_flops(flops_per_token)} flops/token, "
+        f"mfu_peak={mfu_peak_tflops:.1f} TFLOPS"
     )
 
     started = time.time()
@@ -116,10 +131,20 @@ def train(
             val_loss = validate(model, val_data, cfg, seq_len)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        tok_s = tokens_per_step / (last_epoch_time / cfg.train_steps)
+        epoch_tokens = tokens_per_step * cfg.train_steps
+        tokens_processed = epoch_tokens * (epoch + 1)
+        tok_s = epoch_tokens / max(last_epoch_time, 1e-9)
+        flops_s = tok_s * flops_per_token
+        mfu = compute_mfu(flops_s, mfu_peak_tflops)
+        history["tokens_processed"].append(tokens_processed)
+        history["tokens_per_second"].append(tok_s)
+        history["flops_per_second"].append(flops_s)
+        history["mfu"].append(mfu)
         print(
             f"[{epoch + 1}/{cfg.epochs}] train={train_loss:.4f} "
-            f"val={val_loss:.4f} {tok_s:.0f} tok/s"
+            f"val={val_loss:.4f} tokens={tokens_processed / 1e6:.1f}M "
+            f"tok/s={tok_s:.0f} "
+            f"flops/s={format_flops(flops_s)} mfu={format_mfu(mfu)}"
         )
         if cfg.checkpoint_interval and (epoch + 1) % cfg.checkpoint_interval == 0:
             save_training_state(
@@ -140,6 +165,9 @@ def train(
         "last_epoch_time": last_epoch_time,
         "tokens_covered": tokens_seen,
         "total_params": total_params,
+        "flops_per_token": flops_per_token,
+        "mfu_peak_tflops": mfu_peak_tflops,
+        "mfu_peak_gpu": DEFAULT_GPU_NAME if cfg.mfu_peak_tflops <= 0 else "override",
     }
     write_json(cfg.out_dir / "metrics.json", metrics)
     save_training_state(
@@ -272,3 +300,68 @@ def cosine_with_warmup(
 def write_json(path: Path, data: dict) -> None:
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def ensure_history_keys(history: dict) -> None:
+    target_len = len(history.get("train_loss", []))
+    for key in ("tokens_processed", "tokens_per_second", "flops_per_second", "mfu"):
+        values = history.setdefault(key, [])
+        if len(values) < target_len:
+            values.extend([float("nan")] * (target_len - len(values)))
+
+
+def estimate_training_flops_per_token(
+    model: torch.nn.Module,
+    total_params: int | None = None,
+) -> float:
+    """Estimate dense training FLOPs per token for a decoder-only transformer.
+
+    This follows the common GPT MFU estimate from nanoGPT: parameter matmuls
+    cost roughly 6x parameters per token for forward+backward, plus the
+    quadratic attention term.
+    """
+
+    base = unwrap_model(model)
+    cfg = base.config
+    params = total_params if total_params is not None else sum(
+        param.numel() for param in base.parameters()
+    )
+    attention = 12 * cfg.n_layers * cfg.n_dim * cfg.seq_len
+    return float(6 * params + attention)
+
+
+def compute_mfu(flops_per_second: float, peak_tflops: float) -> float:
+    if peak_tflops <= 0:
+        return float("nan")
+    return flops_per_second / (peak_tflops * 1e12)
+
+
+def resolve_mfu_peak_tflops(precision: str, override_tflops: float = 0.0) -> float:
+    if override_tflops > 0:
+        return override_tflops
+    try:
+        return GPU_PEAK_TFLOPS_BY_PRECISION[precision]
+    except KeyError as exc:
+        supported = ", ".join(sorted(GPU_PEAK_TFLOPS_BY_PRECISION))
+        raise ValueError(
+            f"no default MFU peak for precision {precision!r}; use one of: {supported}"
+        ) from exc
+
+
+def format_flops(value: float) -> str:
+    units = (
+        ("PFLOP", 1e15),
+        ("TFLOP", 1e12),
+        ("GFLOP", 1e9),
+        ("MFLOP", 1e6),
+    )
+    for suffix, scale in units:
+        if abs(value) >= scale:
+            return f"{value / scale:.2f} {suffix}"
+    return f"{value:.0f} FLOP"
+
+
+def format_mfu(value: float) -> str:
+    if math.isnan(value):
+        return "n/a"
+    return f"{100 * value:.2f}%"
